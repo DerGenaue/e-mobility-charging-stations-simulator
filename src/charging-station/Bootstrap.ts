@@ -3,6 +3,7 @@
 import type { Worker } from 'node:worker_threads'
 
 import { EventEmitter } from 'node:events'
+import { readFileSync } from 'node:fs'
 import { dirname, extname, join } from 'node:path'
 import process, { env, exit } from 'node:process'
 import { fileURLToPath } from 'node:url'
@@ -56,7 +57,13 @@ import {
   WorkerFactory,
 } from '../worker/index.js'
 import { readStateFile, reconstructTemplateIndexes, writeStateFile } from './BootstrapStateUtils.js'
-import { buildTemplateName, waitChargingStationEvents } from './Helpers.js'
+import {
+  buildTemplateName,
+  getChargingStationId,
+  getHashId,
+  waitChargingStationEvents,
+} from './Helpers.js'
+import { validateTemplate } from './TemplateValidation.js'
 import { type AbstractUIServer, UIServerFactory } from './ui-server/index.js'
 
 const moduleName = 'Bootstrap'
@@ -203,10 +210,24 @@ export class Bootstrap extends EventEmitter implements IBootstrap {
         'Cannot add charging station while the charging stations simulator is not started'
       )
     }
+    const templatePath = join(this.assetsDir, 'station-templates', templateFile)
+    // Reject a runtime add whose identity is already in use before spawning a
+    // worker: a fixedName station derives the same hashId across indexes, so a
+    // second one would spawn a duplicate worker sharing a single hashId -- an
+    // unmanageable duplicate that also leaves an orphan connected on delete.
+    // See issue #2018. (Skipped during startup, where indexes are contiguous.)
+    if (this.started) {
+      const hashId = this.computeStationHashId(index, templatePath, options)
+      if (hashId != null && this.uiServer.hasChargingStationData(hashId)) {
+        throw new BaseError(
+          `Cannot add charging station from template '${templateFile}': identity already in use (hashId '${hashId}')`
+        )
+      }
+    }
     const stationInfo = await this.workerImplementation?.addElement({
       index,
       options,
-      templateFile: join(this.assetsDir, 'station-templates', templateFile),
+      templateFile: templatePath,
     })
     const templateStatistics = this.templateStatistics.get(buildTemplateName(templateFile))
     if (stationInfo != null && templateStatistics != null) {
@@ -327,6 +348,49 @@ export class Bootstrap extends EventEmitter implements IBootstrap {
       this.stopPromise = undefined
     })
     return this.stopPromise
+  }
+
+  /**
+   * Reproduces, in the main thread, the hashId a worker would derive for a
+   * station created from `templatePath` with `options`, so a duplicate identity
+   * can be rejected before a worker is spawned. Uses the same template
+   * validation and id/hash helpers as the worker; returns undefined (skipping
+   * the pre-check) if the template cannot be read or validated here.
+   * @param index - Instance index the station would be created with.
+   * @param templatePath - Absolute path to the station template file.
+   * @param options - Creation options that may override the identity fields.
+   * @returns The would-be hashId, or undefined if it cannot be computed.
+   */
+  private computeStationHashId (
+    index: number,
+    templatePath: string,
+    options?: ChargingStationOptions
+  ): string | undefined {
+    try {
+      const template = validateTemplate(
+        JSON.parse(readFileSync(templatePath, 'utf8')) as Record<string, unknown>,
+        templatePath
+      )
+      // Mirror the identity fields setChargingStationOptions applies so the
+      // computed hashId matches the one the worker derives in initialize().
+      const nameTemplate = { ...template }
+      if (options?.baseName != null) {
+        nameTemplate.baseName = options.baseName
+      }
+      if (options?.fixedName != null) {
+        nameTemplate.fixedName = options.fixedName
+      }
+      if (options?.nameSuffix != null) {
+        nameTemplate.nameSuffix = options.nameSuffix
+      }
+      return getHashId(index, template, getChargingStationId(index, nameTemplate))
+    } catch (error) {
+      logger.warn(
+        `${this.logPrefix()} ${moduleName}.addChargingStation: Failed to pre-compute hashId for duplicate detection:`,
+        error
+      )
+      return undefined
+    }
   }
 
   private async doStart (): Promise<void> {
